@@ -7,11 +7,15 @@ from typing import Any, Dict, Optional
 
 import azure.functions as func
 import requests
-from azure.storage.blob import BlobServiceClient
-from azure.storage.blob import ContentSettings
 
 
-VERSION = "VERSION_2026_02_06_peoplehr_v4_flat_fields_json_only"
+VERSION = "VERSION_2026_02_11_peoplehr_v9_send_to_famly_no_blob"
+
+
+FAMLY_CREATE_EMPLOYEES_MUTATION = (
+    "mutation CreateEmployees($createEmployees:[EmployeeInput!]!){ "
+    "employees{ create(employees:$createEmployees){ id }}}"
+)
 
 
 def _mask(s: str, keep_start: int = 4, keep_end: int = 4) -> str:
@@ -35,6 +39,13 @@ def _try_parse_json(text: str) -> Optional[Any]:
         return json.loads(text)
     except Exception:
         return None
+
+
+def _require_env(name: str) -> str:
+    v = (os.environ.get(name) or "").strip()
+    if not v:
+        raise ValueError(f"Missing env var {name}")
+    return v
 
 
 def _extract_employee_id(req: func.HttpRequest) -> Dict[str, Any]:
@@ -144,34 +155,6 @@ def _peoplehr_get_employee_detail(employee_id: str) -> Dict[str, Any]:
     }
 
 
-def _blob_client() -> BlobServiceClient:
-    conn_str = (os.environ.get("PEOPLEHR_STORAGE_CONNECTION_STRING") or "").strip()
-    if not conn_str:
-        raise ValueError("Missing env var PEOPLEHR_STORAGE_CONNECTION_STRING")
-    return BlobServiceClient.from_connection_string(conn_str)
-
-
-def _upload_to_blob(
-    container_name: str,
-    blob_name: str,
-    content: bytes,
-    content_type: str,
-    content_encoding: Optional[str] = None,
-) -> None:
-    svc = _blob_client()
-    container = svc.get_container_client(container_name)
-    blob = container.get_blob_client(blob_name)
-
-    blob.upload_blob(
-        content,
-        overwrite=True,
-        content_settings=ContentSettings(
-            content_type=content_type,
-            content_encoding=content_encoding,
-        ),
-    )
-
-
 def _get_display_value(result_obj: Any, field_name: str) -> str:
     if not isinstance(result_obj, dict):
         return ""
@@ -182,6 +165,48 @@ def _get_display_value(result_obj: Any, field_name: str) -> str:
     if v is None:
         return ""
     return str(v)
+
+
+def _load_role_mapping() -> Dict[str, str]:
+    raw = _require_env("FAMLY_ROLE_MAPPING_JSON")
+    obj = _try_parse_json(raw)
+    if not isinstance(obj, dict):
+        raise ValueError("FAMLY_ROLE_MAPPING_JSON must be a JSON object mapping PeopleHR JobRole -> Famly roleId")
+
+    out: Dict[str, str] = {}
+    for k, v in obj.items():
+        if k is None or v is None:
+            continue
+        ks = str(k).strip()
+        vs = str(v).strip()
+        if ks and vs:
+            out[ks] = vs
+
+    if not out:
+        raise ValueError("FAMLY_ROLE_MAPPING_JSON parsed but produced an empty mapping")
+    return out
+
+
+def _make_famly_headers(access_token: str) -> Dict[str, str]:
+    return {
+        "Content-Type": "application/json",
+        "x-famly-accesstoken": access_token,
+    }
+
+
+def _famly_graphql_post(endpoint: str, access_token: str, body: Dict[str, Any]) -> Dict[str, Any]:
+    headers = _make_famly_headers(access_token)
+    r = requests.post(endpoint, headers=headers, data=json.dumps(body), timeout=30)
+    body_text = r.text or ""
+
+    logging.info(f"[{VERSION}] Famly response status={r.status_code}")
+    logging.info(f"[{VERSION}] Famly response snippet={body_text[:800]}")
+
+    return {
+        "http_status": r.status_code,
+        "body_text": body_text,
+        "headers": dict(r.headers),
+    }
 
 
 def main(req: func.HttpRequest) -> func.HttpResponse:
@@ -208,85 +233,97 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             "mode": "no_employee_id",
             "run_id": run_id,
             "employee_id": None,
-            "note": "No employee_id found in payload. Nothing sent to PeopleHR. Nothing stored.",
+            "note": "No employee_id found in payload. Nothing sent to PeopleHR. Nothing sent to Famly.",
         }
         return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
 
-    container_name = (os.environ.get("PEOPLEHR_STORAGE_CONTAINER") or "peoplehrinitial").strip()
-    prefix = (os.environ.get("PEOPLEHR_STORAGE_PREFIX") or "peoplehr_raw").strip()
-
-    now = _utc_now()
-    base_name = f"{prefix}/{now:%Y/%m/%d}/{employee_id}/{now:%H%M%S}_{run_id}"
-    blob_name_json = f"{base_name}.json"
-
-    logging.info(
-        f"[{VERSION}] run_id={run_id} storage_container={container_name} blob_name_json={blob_name_json}"
-    )
-
     try:
+        famly_endpoint = _require_env("FAMLY_API_ENDPOINT")
+        famly_access_token = _require_env("FAMLY_ACCESS_TOKEN")
+        famly_institution_id = _require_env("FAMLY_INSTITUTION_ID")
+        famly_group_id = _require_env("FAMLY_GROUP_ID_TEST_ROOM")
+        role_mapping = _load_role_mapping()
+
         peoplehr = _peoplehr_get_employee_detail(employee_id)
-        status = peoplehr["http_status"]
+        peoplehr_status = peoplehr["http_status"]
         body_text = peoplehr["body_text"]
 
         parsed_body = _try_parse_json(body_text) if body_text else None
         result_obj = parsed_body.get("Result") if isinstance(parsed_body, dict) else None
 
-        employee_fields = {
-            "fullName": (
-                f"{_get_display_value(result_obj, 'FirstName')} "
-                f"{_get_display_value(result_obj, 'LastName')}".strip()
-            ),
-            "birthDate": _get_display_value(result_obj, "DateOfBirth"),
-            "email": _get_display_value(result_obj, "EmailId"),
-            "firstDay": _get_display_value(result_obj, "StartDate"),
-            "title": _get_display_value(result_obj, "Gender"),
-            "roleId": _get_display_value(result_obj, "JobRole"),
-            "siteId": _get_display_value(result_obj, "Department"),
+        first_name = _get_display_value(result_obj, "FirstName")
+        last_name = _get_display_value(result_obj, "LastName")
+        full_name = f"{first_name} {last_name}".strip()
+
+        email = _get_display_value(result_obj, "EmailId")
+        if not email:
+            email = f"{employee_id.lower()}@placeholder.local"
+
+        first_day = _get_display_value(result_obj, "StartDate")
+
+        job_role = _get_display_value(result_obj, "JobRole")
+        mapped_role_id = role_mapping.get(job_role, "")
+
+        logging.info(f"[{VERSION}] run_id={run_id} job_role={job_role} mapped_role_id={mapped_role_id}")
+
+        if not mapped_role_id:
+            resp = {
+                "status": "error",
+                "version": VERSION,
+                "run_id": run_id,
+                "employee_id": employee_id,
+                "peoplehr_http_status": peoplehr_status,
+                "error": f"Unmapped PeopleHR JobRole -> Famly roleId: '{job_role}'",
+            }
+            return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
+
+        famly_employee_input = {
+            "name": full_name,
+            "institutionId": famly_institution_id,
+            "groupId": famly_group_id,
+            "roleId": mapped_role_id,
+            "email": email,
+            "firstDay": first_day if first_day else None,
+            "employeeWorkDayHours": 7.5,
+            "employeeWorkDayMin": 450,
         }
 
-        out_obj: Dict[str, Any] = {
-            "status": "ok" if status == 200 else "error",
-            "version": VERSION,
-            "run_id": run_id,
-            "employee_id": employee_id,
-            "peoplehr_http_status": status,
-            "employee": employee_fields,
-            "captured_at": _utc_now_iso(),
+        famly_request_body = {
+            "query": FAMLY_CREATE_EMPLOYEES_MUTATION,
+            "variables": {"createEmployees": [famly_employee_input]},
         }
 
-        raw_json_pretty = json.dumps(out_obj, indent=2, ensure_ascii=False).encode("utf-8")
+        logging.info(f"[{VERSION}] run_id={run_id} famly_endpoint={famly_endpoint}")
+        logging.info(f"[{VERSION}] run_id={run_id} famly_request_body={json.dumps(famly_request_body)}")
 
-        logging.info(
-            f"[{VERSION}] run_id={run_id} uploading blob bytes_json={len(raw_json_pretty)}"
-        )
+        famly = _famly_graphql_post(famly_endpoint, famly_access_token, famly_request_body)
+        famly_status = famly["http_status"]
+        famly_body_text = famly["body_text"]
 
-        _upload_to_blob(
-            container_name=container_name,
-            blob_name=blob_name_json,
-            content=raw_json_pretty,
-            content_type="application/json",
-            content_encoding=None,
-        )
-
-        logging.info(
-            f"[{VERSION}] run_id={run_id} blob_upload_success json={blob_name_json}"
-        )
+        famly_body_json = _try_parse_json(famly_body_text)
+        created_id = None
+        if isinstance(famly_body_json, dict):
+            try:
+                created_id = famly_body_json["data"]["employees"]["create"][0]["id"]
+            except Exception:
+                created_id = None
 
         resp = {
-            "status": out_obj["status"],
+            "status": "ok" if (peoplehr_status == 200 and famly_status == 200) else "error",
             "version": VERSION,
             "run_id": run_id,
             "employee_id": employee_id,
-            "peoplehr_http_status": status,
-            "blob_container": container_name,
-            "blob_name_json": blob_name_json,
+            "peoplehr_http_status": peoplehr_status,
+            "famly_http_status": famly_status,
+            "famly_employee_id": created_id,
+            "famly_response": famly_body_json if famly_body_json is not None else famly_body_text,
+            "captured_at": _utc_now_iso(),
         }
 
         return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
 
     except Exception as e:
         logging.exception(f"[{VERSION}] run_id={run_id} failed: {repr(e)}")
-
         resp = {
             "status": "error",
             "version": VERSION,
