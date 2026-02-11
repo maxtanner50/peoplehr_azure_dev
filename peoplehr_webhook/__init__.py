@@ -232,14 +232,16 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         result_obj = parsed_body.get("Result") if isinstance(parsed_body, dict) else None
 
         employee_fields = {
-            "first_name": _get_display_value(result_obj, "FirstName"),
-            "last_name": _get_display_value(result_obj, "LastName"),
+            "fullName": (
+                f"{_get_display_value(result_obj, 'FirstName')} "
+                f"{_get_display_value(result_obj, 'LastName')}".strip()
+            ),
+            "birthDate": _get_display_value(result_obj, "DateOfBirth"),
             "email": _get_display_value(result_obj, "EmailId"),
-            "date_of_birth": _get_display_value(result_obj, "DateOfBirth"),
-            "start_date": _get_display_value(result_obj, "StartDate"),
-            "gender": _get_display_value(result_obj, "Gender"),
-            "employment_type": _get_display_value(result_obj, "EmploymentType"),
-            "department": _get_display_value(result_obj, "Department"),
+            "firstDay": _get_display_value(result_obj, "StartDate"),
+            "title": _get_display_value(result_obj, "Gender"),
+            "roleId": _get_display_value(result_obj, "JobRole"),
+            "siteId": _get_display_value(result_obj, "Department"),
         }
 
         out_obj: Dict[str, Any] = {
