@@ -9,7 +9,7 @@ import azure.functions as func
 import requests
 
 
-VERSION = "VERSION_2026_02_11_peoplehr_v9_send_to_famly_no_blob"
+VERSION = "VERSION_2026_02_11_peoplehr_v11_email_required_with_placeholder"
 
 
 FAMLY_CREATE_EMPLOYEES_MUTATION = (
@@ -46,6 +46,11 @@ def _require_env(name: str) -> str:
     if not v:
         raise ValueError(f"Missing env var {name}")
     return v
+
+
+def _env(name: str, default: str) -> str:
+    v = (os.environ.get(name) or "").strip()
+    return v if v else default
 
 
 def _extract_employee_id(req: func.HttpRequest) -> Dict[str, Any]:
@@ -164,7 +169,7 @@ def _get_display_value(result_obj: Any, field_name: str) -> str:
     v = field_obj.get("DisplayValue")
     if v is None:
         return ""
-    return str(v)
+    return str(v).strip()
 
 
 def _load_role_mapping() -> Dict[str, str]:
@@ -209,6 +214,14 @@ def _famly_graphql_post(endpoint: str, access_token: str, body: Dict[str, Any]) 
     }
 
 
+def _add_if_present(target: Dict[str, Any], key: str, value: Any) -> None:
+    if value is None:
+        return
+    if isinstance(value, str) and not value.strip():
+        return
+    target[key] = value
+
+
 def main(req: func.HttpRequest) -> func.HttpResponse:
     run_id = str(uuid.uuid4())
     started = _utc_now_iso()
@@ -244,6 +257,8 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         famly_group_id = _require_env("FAMLY_GROUP_ID_TEST_ROOM")
         role_mapping = _load_role_mapping()
 
+        placeholder_domain = _env("FAMLY_PLACEHOLDER_EMAIL_DOMAIN", "placeholder.local")
+
         peoplehr = _peoplehr_get_employee_detail(employee_id)
         peoplehr_status = peoplehr["http_status"]
         body_text = peoplehr["body_text"]
@@ -255,16 +270,24 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
         last_name = _get_display_value(result_obj, "LastName")
         full_name = f"{first_name} {last_name}".strip()
 
+        start_date = _get_display_value(result_obj, "StartDate")
         email = _get_display_value(result_obj, "EmailId")
-        if not email:
-            email = f"{employee_id.lower()}@placeholder.local"
+        dob = _get_display_value(result_obj, "DateOfBirth")
+        gender = _get_display_value(result_obj, "Gender")
 
-        first_day = _get_display_value(result_obj, "StartDate")
+        if not email:
+            email = f"{employee_id.lower()}@{placeholder_domain}"
 
         job_role = _get_display_value(result_obj, "JobRole")
         mapped_role_id = role_mapping.get(job_role, "")
 
         logging.info(f"[{VERSION}] run_id={run_id} job_role={job_role} mapped_role_id={mapped_role_id}")
+
+        if not full_name:
+            raise ValueError("PeopleHR returned empty FirstName/LastName (required to build Famly name)")
+
+        if not start_date:
+            raise ValueError("PeopleHR returned empty StartDate (required for Famly firstDay)")
 
         if not mapped_role_id:
             resp = {
@@ -277,16 +300,17 @@ def main(req: func.HttpRequest) -> func.HttpResponse:
             }
             return func.HttpResponse(json.dumps(resp), status_code=200, mimetype="application/json")
 
-        famly_employee_input = {
+        famly_employee_input: Dict[str, Any] = {
             "name": full_name,
             "institutionId": famly_institution_id,
             "groupId": famly_group_id,
             "roleId": mapped_role_id,
+            "firstDay": start_date,
             "email": email,
-            "firstDay": first_day if first_day else None,
-            "employeeWorkDayHours": 7.5,
-            "employeeWorkDayMin": 450,
         }
+
+        _add_if_present(famly_employee_input, "birthDate", dob)
+        _add_if_present(famly_employee_input, "title", gender)
 
         famly_request_body = {
             "query": FAMLY_CREATE_EMPLOYEES_MUTATION,
